@@ -7,6 +7,8 @@ use std::io::prelude::*;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
+use detach::serialize;
+
 const PID: &'static str = "/tmp/detach.pid";
 const SOCKET: &'static str = "/tmp/detach.sock";
 const STDOUT: &'static str = "/tmp/detach.out";
@@ -26,6 +28,7 @@ enum Action {
     Worker,
     Get(GetAction),
     Set(SetAction),
+    Delete(DeleteAction),
     #[clap(about = "Dump the background worker's state.")]
     Dump,
     #[clap(about = "Close the background worker (if one is open).")]
@@ -48,6 +51,13 @@ struct SetAction {
     value: String,
 }
 
+#[derive(Clap, Debug)]
+#[clap(about = "Delete the value for a key (if any).")]
+struct DeleteAction {
+    #[clap(index = 1)]
+    key: String,
+}
+
 fn main() {
     match handle_command(Opts::parse()) {
         Ok(_) => (),
@@ -60,68 +70,70 @@ fn handle_command(opts: Opts) -> io::Result<()> {
         Action::Worker => worker_command(),
         Action::Get(GetAction { key }) => get_command(key),
         Action::Set(SetAction { key, value }) => set_command(key, value),
+        Action::Delete(DeleteAction { key }) => delete_command(key),
         Action::Dump => dump_command(),
         Action::Quit => quit_command(),
     }
 }
 
-struct Stream {
-    inner: UnixStream,
+struct Socket {
+    inner: UnixListener,
     path: PathBuf,
 }
 
-impl Stream {
-    fn connect<P>(path: P) -> io::Result<Self>
+impl Socket {
+    fn bind<P>(path: P) -> io::Result<Self>
     where
         P: AsRef<Path>,
     {
         let path_buf = PathBuf::from(path.as_ref());
         Ok(Self {
-            inner: UnixStream::connect(path)?,
+            inner: UnixListener::bind(path)?,
             path: path_buf,
         })
     }
 }
 
-impl std::ops::Drop for Stream {
+impl std::ops::Drop for Socket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(self.path.as_path()).unwrap();
     }
 }
 
-impl std::ops::Deref for Stream {
-    type Target = UnixStream;
+impl std::ops::Deref for Socket {
+    type Target = UnixListener;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl std::ops::DerefMut for Stream {
+impl std::ops::DerefMut for Socket {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-fn connect() -> io::Result<Stream> {
-    Stream::connect(SOCKET)
+fn connect() -> io::Result<UnixStream> {
+    UnixStream::connect(SOCKET)
 }
 
-fn send(stream: &mut UnixStream, command: SocketCommand) -> io::Result<()> {
+fn send(stream: &mut UnixStream, command: serialize::Command) -> io::Result<()> {
     stream.write_all(format!("{}\n", command).as_bytes())
 }
 
-fn recv(stream: &mut UnixStream) -> io::Result<SocketResponse> {
+fn recv(stream: &mut UnixStream) -> io::Result<serialize::Response> {
     // most commands (other than SET) should fit in 16 bytes
     let mut res = String::with_capacity(16);
     let mut buf_reader = io::BufReader::new(stream);
     buf_reader.read_line(&mut res)?;
     res.pop(); // trim trailing newline
 
-    parse_response(res)
+    res.parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "parse error"))
 }
 
-fn command(cmd: SocketCommand) -> io::Result<()> {
+fn command(cmd: serialize::Command) -> io::Result<()> {
     let mut stream = connect()?;
     send(&mut stream, cmd)?;
 
@@ -132,19 +144,26 @@ fn command(cmd: SocketCommand) -> io::Result<()> {
 }
 
 fn get_command(key: String) -> io::Result<()> {
-    command(SocketCommand::Get { key })
+    command(serialize::Command::Get { key })
 }
 
 fn set_command(key: String, value: String) -> io::Result<()> {
-    command(SocketCommand::Set { key, value })
+    command(serialize::Command::Set {
+        key,
+        value: serialize::WrappedValue::from_string(value),
+    })
+}
+
+fn delete_command(key: String) -> io::Result<()> {
+    command(serialize::Command::Delete { key })
 }
 
 fn dump_command() -> io::Result<()> {
-    command(SocketCommand::Dump)
+    command(serialize::Command::Dump)
 }
 
 fn quit_command() -> io::Result<()> {
-    command(SocketCommand::Quit)
+    command(serialize::Command::Quit)
 }
 
 fn worker_command() -> io::Result<()> {
@@ -177,7 +196,7 @@ struct AppState {
 fn start_socket() -> io::Result<()> {
     println!("I'm a worker!");
 
-    let listener = UnixListener::bind(SOCKET).expect("unable to bind to socket");
+    let listener = Socket::bind(SOCKET).expect("unable to bind to socket");
     let mut state = AppState::default();
 
     loop {
@@ -197,35 +216,35 @@ fn start_socket() -> io::Result<()> {
     Ok(())
 }
 
-// # commands
-//
-//   GET <key>
-//   SET <key> <value>
-//   DUMP
-//   QUIT
-//
-// # responses
-//
-//   VALUE <value>
-//   OK
-//
-
 fn accept_connection(mut socket: UnixStream, state: &mut AppState) -> io::Result<()> {
     let mut req = String::with_capacity(16);
     let mut buf_reader = io::BufReader::new(&mut socket);
     buf_reader.read_line(&mut req)?;
     req.pop(); // remove trailing newline
 
-    let res = match parse_command(req)? {
-        SocketCommand::Get { key } => SocketResponse::Value(state.db.get(&key).cloned()),
-        SocketCommand::Set { key, value } => {
-            state.db.insert(key, value);
-            SocketResponse::Ok
+    let res = match req
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "parse error"))?
+    {
+        serialize::Command::Get { key } => {
+            serialize::Response::Value(serialize::WrappedValue::from_string(
+                state.db.get(&key).cloned().unwrap_or_else(String::new),
+            ))
         }
-        SocketCommand::Dump => SocketResponse::Value(Some(format!("{:?}", state.db))),
-        SocketCommand::Quit => {
+        serialize::Command::Set { key, value } => {
+            state.db.insert(key, value.into_inner());
+            serialize::Response::Ok
+        }
+        serialize::Command::Delete { key } => {
+            state.db.remove(&key);
+            serialize::Response::Ok
+        }
+        serialize::Command::Dump => serialize::Response::Value(
+            serialize::WrappedValue::from_string(format!("{:?}", state.db)),
+        ),
+        serialize::Command::Quit => {
             state.should_terminate = true;
-            SocketResponse::Ok
+            serialize::Response::Ok
         }
     };
 
@@ -235,74 +254,4 @@ fn accept_connection(mut socket: UnixStream, state: &mut AppState) -> io::Result
     eprintln!("state: {:?}", state);
 
     Ok(())
-}
-
-#[derive(Debug)]
-enum SocketCommand {
-    Get { key: String },
-    Set { key: String, value: String },
-    Dump,
-    Quit,
-}
-
-#[derive(Debug)]
-enum SocketResponse {
-    Value(Option<String>),
-    Err(String),
-    Ok,
-}
-
-// FIXME: implement TryInto
-fn parse_command(mut res: String) -> io::Result<SocketCommand> {
-    match &res[..4] {
-        "GET " => Ok(SocketCommand::Get {
-            key: res.split_off(4),
-        }),
-        "SET " => {
-            let key_value = res.split_off(4);
-            if let Some((key, value)) = key_value.split_once(' ') {
-                Ok(SocketCommand::Set {
-                    key: key.into(),
-                    value: value.into(),
-                })
-            } else {
-                Err(io::Error::new(io::ErrorKind::Other, "not enough args"))
-            }
-        }
-        "DUMP" => Ok(SocketCommand::Dump),
-        "QUIT" => Ok(SocketCommand::Quit),
-        _ => Err(io::Error::new(io::ErrorKind::Other, "unrecognized command")),
-    }
-}
-
-// FIXME: implement TryInto
-fn parse_response(mut res: String) -> io::Result<SocketResponse> {
-    match &res[..2] {
-        "OK" => Ok(SocketResponse::Ok),
-        "ER" => Ok(SocketResponse::Err(res.split_off(4))),
-        "VA" => Ok(SocketResponse::Value(Some(res.split_off(6)))),
-        _ => Err(io::Error::new(io::ErrorKind::Other, "unrecognized command")),
-    }
-}
-
-impl std::fmt::Display for SocketCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            SocketCommand::Get { ref key } => write!(f, "GET {}", key),
-            SocketCommand::Set { ref key, ref value } => write!(f, "SET {} {}", key, value),
-            SocketCommand::Dump => write!(f, "DUMP"),
-            SocketCommand::Quit => write!(f, "QUIT"),
-        }
-    }
-}
-
-impl std::fmt::Display for SocketResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            SocketResponse::Value(Some(ref value)) => write!(f, "VALUE {}", value),
-            SocketResponse::Value(None) => write!(f, "VALUE <null>"),
-            SocketResponse::Err(ref error) => write!(f, "ERR {}", error),
-            SocketResponse::Ok => write!(f, "OK"),
-        }
-    }
 }
